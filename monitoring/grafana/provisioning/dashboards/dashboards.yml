@@ -1,0 +1,16 @@
+# Grafana dashboard provisioning
+# Auto-loads dashboards from the mounted directory
+
+apiVersion: 1
+
+providers:
+  - name: 'Claude SDK Dashboards'
+    orgId: 1
+    folder: 'Claude SDK'
+    folderUid: 'claude-sdk'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,451 @@
+syntax = "proto3";
+package claude_sidecar.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/dgarson/claude-sidecar/gen/claude_sidecar/v1;v1";
+
+service ClaudeSidecar {
+  // Control plane
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+
+  // Fork is explicit; used to branch and/or change immutable options/tools/hooks safely
+  rpc ForkSession(ForkSessionRequest) returns (ForkSessionResponse);
+
+  // File checkpoint restore (control plane; may be called while attached)
+  rpc RewindFiles(RewindFilesRequest) returns (RewindFilesResponse);
+
+  // Data plane: attach to an existing session and drive it
+  rpc AttachSession(stream ClientEvent) returns (stream ServerEvent);
+}
+
+message GetInfoRequest {}
+message GetInfoResponse {
+  string protocol_version = 1;
+  string sidecar_version = 2;
+  string python_sdk_version = 3;
+  string claude_code_cli_version = 4;
+  repeated string capabilities = 5; // "hooks","sdk_mcp","checkpointing","structured_outputs","sandbox",...
+}
+
+message HealthCheckRequest {}
+message HealthCheckResponse { string status = 1; string version = 2; }
+
+enum SessionMode { SESSION_MODE_UNSPECIFIED = 0; ONE_SHOT = 1; INTERACTIVE = 2; }
+
+message CreateSessionRequest {
+  SessionMode mode = 1;
+
+  // Resume/fork semantics (explicit)
+  string resume_claude_session_id = 2; // optional
+  bool fork = 3;                       // if resume set, branch into a new id
+
+  ClaudeAgentOptions options = 4;      // immutable per session
+}
+message CreateSessionResponse {
+  string sidecar_session_id = 1;
+  // Best-effort: may be empty until init arrives
+  string claude_session_id = 2;
+}
+
+message GetSessionRequest { string sidecar_session_id = 1; }
+message GetSessionResponse { SessionSummary session = 1; }
+
+message ListSessionsRequest {}
+message ListSessionsResponse { repeated SessionSummary sessions = 1; }
+
+message DeleteSessionRequest { string sidecar_session_id = 1; bool force = 2; }
+message DeleteSessionResponse { bool success = 1; }
+
+message ForkSessionRequest {
+  string sidecar_session_id = 1;         // fork from this running session
+  string base_claude_session_id = 2;     // optional override; if empty, use current known id
+  ClaudeAgentOptions options = 3;        // new immutable options for forked session (may differ)
+}
+message ForkSessionResponse { string sidecar_session_id = 1; string claude_session_id = 2; }
+
+message RewindFilesRequest { string sidecar_session_id = 1; string checkpoint_uuid = 2; }
+message RewindFilesResponse { bool success = 1; string message = 2; }
+
+message SessionSummary {
+  string sidecar_session_id = 1;
+  string claude_session_id = 2;                 // best-effort known id
+  SessionMode mode = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+// =====================
+// Data plane (AttachSession)
+// =====================
+
+message ClientEvent {
+  string request_id = 1;            // correlation for client-initiated commands
+  string sidecar_session_id = 2;    // MUST be set for all messages
+
+  oneof payload {
+    ClientHello hello = 90;
+
+    QueryRequest query = 10;
+    StreamInputChunk input_chunk = 11;
+    EndInputStream end_input = 12;
+
+    InterruptRequest interrupt = 20;
+    CancelRequest cancel = 21;
+    SetPermissionModeRequest set_permission_mode = 22;
+    SetModelRequest set_model = 23;
+
+    ToolInvocationResponse tool_response = 30;
+    HookInvocationResponse hook_response = 31;
+    PermissionDecisionResponse permission_response = 32;
+  }
+}
+
+message ServerEvent {
+  string request_id = 1;            // echo query request_id for turn events; otherwise unique or empty
+  string sidecar_session_id = 2;
+  string turn_id = 3;               // set for events belonging to a specific turn; empty for init/background
+
+  oneof payload {
+    ServerHello hello = 10;
+
+    SessionInit session_init = 20;
+    TurnBoundary turn = 21;
+    MessageEvent message = 22;
+    StderrLine stderr_line = 23;
+
+    ToolInvocationRequest tool_request = 30;
+    HookInvocationRequest hook_request = 31;
+    PermissionDecisionRequest permission_request = 32;
+
+    SidecarError error = 40;
+    SessionClosed session_closed = 41;
+  }
+}
+
+message ClientHello { string protocol_version = 1; string client_name = 2; string client_version = 3; }
+message ServerHello { string protocol_version = 1; }
+
+// Query supports both text and Python-style async event streams (dicts)
+message QueryRequest {
+  oneof prompt {
+    string prompt_text = 1;
+    string input_stream_id = 2; // client will send StreamInputChunk events with this id, then EndInputStream
+  }
+}
+
+message StreamInputChunk {
+  string input_stream_id = 1;
+  google.protobuf.Struct event = 2; // raw dict event compatible with Python SDK stream input
+}
+message EndInputStream { string input_stream_id = 1; }
+
+message InterruptRequest {}
+message CancelRequest { string reason = 1; }
+message SetPermissionModeRequest { string mode = 1; }
+message SetModelRequest { string model = 1; }
+
+// Turn boundaries
+message TurnBoundary {
+  enum Kind { KIND_UNSPECIFIED = 0; TURN_BEGIN = 1; TURN_END = 2; }
+  Kind kind = 1;
+  uint32 turn_index = 2;
+}
+
+// =====================
+// Options (immutable per session)
+// =====================
+
+message ClaudeAgentOptions {
+  // Tool configuration. This is distinct from allowed/disallowed tool permissions.
+  oneof tools {
+    ToolsList tools_list = 3;
+    ToolsPreset tools_preset = 4; // e.g. preset="claude_code"
+  }
+
+  repeated string allowed_tools = 1;
+  repeated string disallowed_tools = 2;
+
+  oneof system_prompt {
+    string system_prompt_text = 10;
+    SystemPromptPreset system_prompt_preset = 11;
+  }
+
+  // External MCP servers (stdio/http/sse)
+  map<string, McpServerConfig> mcp_servers = 20;
+
+  // Client-defined tools executed by compiled client.
+  // Group by server_key; tool naming: mcp__<server_key>__<tool_name>
+  repeated ClientToolServer client_tool_servers = 21;
+
+  // Client-defined hooks executed by compiled client.
+  repeated HookSpec client_hooks = 22;
+
+  // Permission callback enabled (sidecar will call back to client for can_use_tool)
+  bool permission_callback_enabled = 23;
+
+  string permission_mode = 30;
+  bool continue_conversation = 31;
+  bool enable_file_checkpointing = 32;
+  uint32 max_turns = 33;
+  double max_budget_usd = 34;
+
+  string model = 40;
+  OutputFormat output_format = 41;
+  string fallback_model = 42;
+  repeated string betas = 43;              // e.g. "context-1m-2025-08-07"
+  uint32 max_thinking_tokens = 44;
+
+  string permission_prompt_tool_name = 50;
+  string cwd = 51;
+  string settings_path = 52;
+  repeated string add_dirs = 53;
+  repeated string setting_sources = 54; // "user" | "project" | "local"
+  string cli_path = 55;                  // override Claude Code CLI path
+
+  map<string, string> env = 60;
+  map<string, google.protobuf.Value> extra_args = 61;
+  uint32 max_buffer_size = 62;
+
+  string user = 70;
+  bool include_partial_messages = 71;
+
+  map<string, AgentDefinition> agents = 80;
+  repeated SdkPluginConfig plugins = 81;
+
+  SandboxSettings sandbox = 90;
+}
+
+message ToolsList { repeated string tools = 1; }
+message ToolsPreset {
+  string type = 1;   // "preset"
+  string preset = 2; // "claude_code"
+}
+
+message ClientToolServer {
+  string server_key = 1;
+  repeated ToolSpec tools = 2;
+}
+message ToolSpec {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Struct input_schema = 3; // JSON Schema
+}
+
+message HookSpec {
+  string hook_event = 1;      // "PreToolUse" | "PostToolUse" | "UserPromptSubmit" | "Stop" | "SubagentStop" | "PreCompact"
+  string matcher = 2;         // regex (empty => match all)
+  uint32 timeout_seconds = 3; // 0 => default (60)
+}
+
+message OutputFormat {
+  string type = 1; // "json_schema"
+  google.protobuf.Struct schema = 2;
+}
+message SystemPromptPreset {
+  string type = 1;   // "preset"
+  string preset = 2; // "claude_code"
+  string append = 3;
+}
+
+message AgentDefinition {
+  string description = 1;
+  string prompt = 2;
+  repeated string tools = 3; // empty => inherit
+  string model = 4; // "sonnet" | "opus" | "haiku" | "inherit"
+}
+message SdkPluginConfig { string type = 1; string path = 2; } // type="local"
+
+message McpServerConfig {
+  oneof cfg {
+    McpStdioServerConfig stdio = 1;
+    McpHttpServerConfig http = 2;
+    McpSseServerConfig sse = 3;
+  }
+}
+message McpStdioServerConfig { string command = 1; repeated string args = 2; map<string,string> env = 3; }
+message McpHttpServerConfig { string url = 1; map<string,string> headers = 2; }
+message McpSseServerConfig { string url = 1; map<string,string> headers = 2; }
+
+message SandboxSettings {
+  bool enabled = 1;
+  bool auto_allow_bash_if_sandboxed = 2;
+  repeated string excluded_commands = 3;
+  bool allow_unsandboxed_commands = 4;
+  SandboxNetworkConfig network = 5;
+  SandboxIgnoreViolations ignore_violations = 6;
+  bool enable_weaker_nested_sandbox = 7;
+}
+message SandboxNetworkConfig {
+  bool allow_local_binding = 1;
+  repeated string allow_unix_sockets = 2;
+  bool allow_all_unix_sockets = 3;
+  uint32 http_proxy_port = 4;
+  uint32 socks_proxy_port = 5;
+}
+message SandboxIgnoreViolations { repeated string file = 1; repeated string network = 2; }
+
+// =====================
+// Callback requests/responses
+// =====================
+
+message ToolInvocationRequest {
+  string invocation_id = 1;
+  string tool_fqn = 2;               // "mcp__<server_key>__<tool_name>"
+  google.protobuf.Struct tool_input = 3;
+  string tool_use_id = 4;            // correlate with ToolUseBlock.id if available
+}
+message ToolInvocationResponse {
+  string invocation_id = 1;
+  google.protobuf.Struct tool_result = 2; // MCP tool result dict: {"content":[...], "is_error":false, ...}
+}
+
+message HookInvocationRequest {
+  string invocation_id = 1;
+  string hook_event = 2;
+  string tool_use_id = 3;
+  google.protobuf.Struct input_data = 4; // full hook context dict from Python SDK
+}
+message HookInvocationResponse {
+  string invocation_id = 1;
+  HookOutput output = 2;
+}
+message HookOutput {
+  // IMPORTANT: Claude Code defaults `continue=true` when the field is omitted.
+  // This proto is internal to the sidecar<->client protocol, so we model
+  // presence explicitly and apply a default of true when unset.
+  optional bool continue_ = 1;
+  string stop_reason = 2;
+  bool suppress_output = 3;
+  string system_message = 4;
+  bool async_ = 5;              // defer hook execution (maps to SDK field async_)
+  uint32 async_timeout_ms = 6;  // maps to SDK field asyncTimeout
+  string decision = 7;          // e.g. "block"
+  string reason = 8;            // feedback for Claude about the decision
+  google.protobuf.Struct hook_specific_output = 10; // forward-compatible dict
+}
+
+message PermissionDecisionRequest {
+  string invocation_id = 1;
+  string tool_name = 2;
+  google.protobuf.Struct tool_input = 3;
+  bool is_sandbox_bypass_request = 4;
+
+  // attempt counter for “ask/confirm” UX; server may re-issue request with attempt=2
+  uint32 attempt = 5;
+
+  // optional human-facing prompt suggested by server (best-effort)
+  string prompt = 6;
+
+  // optional hints for UI/UX to propose follow-up permission rules/mode changes.
+  // Expected to be a JSON list of permission update objects.
+  google.protobuf.Value permission_suggestions = 7;
+  // best-effort: file path that triggered a permission block (may be empty).
+  string blocked_path = 8;
+}
+message PermissionDecisionResponse {
+  string invocation_id = 1;
+  PermissionDecision decision = 2;
+}
+message PermissionDecision {
+  string behavior = 1; // "allow" | "deny" | "ask"
+  string reason = 2;
+  google.protobuf.Struct updated_input = 3;
+
+  // Optional permission updates to apply when allowing. Expected to be a JSON list
+  // of permission update objects matching the Agent SDK control protocol.
+  google.protobuf.Value updated_permissions = 4;
+  // Optional hint: deny and interrupt the current run/session.
+  bool interrupt = 5;
+}
+
+// =====================
+// Messages/events (full fidelity)
+// =====================
+
+message SessionInit {
+  // emitted as soon as init is known
+  string claude_session_id = 1;
+  repeated string tools = 2;              // best-effort extraction
+  google.protobuf.Struct raw_init = 3;    // full init payload
+}
+
+message MessageEvent {
+  bool is_partial = 1;
+
+  oneof msg {
+    UserMessage user = 10;
+    AssistantMessage assistant = 11;
+    SystemMessage system = 12;
+    ResultMessage result = 13;
+    StreamEvent stream_event = 14;
+  }
+}
+
+message UserMessage {
+  string checkpoint_uuid = 1;
+  repeated ContentBlock content = 2;
+  string parent_tool_use_id = 3;
+}
+
+message AssistantMessage {
+  string model = 1;
+  repeated ContentBlock content = 2;
+  string parent_tool_use_id = 3;
+  string error = 4;
+}
+
+message SystemMessage {
+  string subtype = 1;                   // e.g. "init"
+  google.protobuf.Struct data = 2;
+}
+
+message ResultMessage {
+  string subtype = 1;
+  uint64 duration_ms = 2;
+  uint64 duration_api_ms = 3;
+  bool is_error = 4;
+  uint32 num_turns = 5;
+  string claude_session_id = 6;
+  double total_cost_usd = 7;
+  google.protobuf.Struct usage = 8;
+  string result = 9;
+  google.protobuf.Struct structured_output = 10;
+}
+
+message StreamEvent {
+  string uuid = 1;
+  string session_id = 2;
+  google.protobuf.Struct event = 3;
+  string parent_tool_use_id = 4;
+}
+
+message ContentBlock {
+  oneof block {
+    TextBlock text = 1;
+    ThinkingBlock thinking = 2;
+    ToolUseBlock tool_use = 3;
+    ToolResultBlock tool_result = 4;
+  }
+}
+message TextBlock { string text = 1; }
+message ThinkingBlock { string thinking = 1; string signature = 2; }
+message ToolUseBlock { string id = 1; string name = 2; google.protobuf.Struct input = 3; }
+message ToolResultBlock { string tool_use_id = 1; google.protobuf.Value content = 2; bool is_error = 3; }
+
+message StderrLine { string line = 1; }
+
+message SessionClosed { string reason = 1; }
+
+message SidecarError {
+  string code = 1;     // "CLI_NOT_FOUND","PROCESS_ERROR","JSON_DECODE","CALLBACK_TIMEOUT","INTERNAL",...
+  string message = 2;
+  string details = 3;
+  bool fatal = 4;
+}
